@@ -1,0 +1,445 @@
+---
+title: "Making an Election Forecast"
+format: html
+---
+
+## Setup
+
+Open the packages I need:
+
+```{r}
+library(tidyverse)
+library(coolorrr)
+set_theme()
+set_palette(binary = c("steelblue", "red3"))
+```
+
+Next, read in the data (source is MIT Harvard Dataverse):
+
+```{r}
+dt <- read_csv(
+  here::here(
+    "_data", 
+    "countypres_2000-2020.csv"
+  )
+)
+```
+
+## Data wrangling
+
+I need to get the data into tidy format. At the moment there are multiple observations per county per year because votes per party are stacked on top of each other. Let's fix that and cut some of the extra fat along the way.
+
+```{r}
+tidy_dt <- dt |>
+  select(year:county_fips) |>
+  distinct()
+
+pty_dt <- dt |>
+  mutate(
+    party = str_to_lower(party),
+    party = ifelse(!(party %in% c("democrat", "republican")),
+                   "other", party)
+  ) |>
+  group_by(party) |>
+  group_split()
+
+tidy_dt |>
+  left_join(
+    pty_dt[[1]] |>
+      select(year, state, county_name, candidatevotes) |>
+      rename(dem = candidatevotes) |>
+      group_by(year, state, county_name) |>
+      summarize(dem = sum(dem))
+  ) |>
+  left_join(
+    pty_dt[[3]] |>
+      select(year, state, county_name, candidatevotes) |>
+      rename(rep = candidatevotes) |>
+      group_by(year, state, county_name) |>
+      summarize(rep = sum(rep))
+  ) |>
+  left_join(
+    pty_dt[[2]] |>
+      select(year, state, county_name, candidatevotes) |>
+      rename(other = candidatevotes) |>
+      group_by(year, state, county_name) |>
+      summarize(other = sum(other, na.rm = T))
+  ) -> tidy_dt
+
+tidy_dt |>
+  mutate(
+    total = dem + rep + other
+  ) -> tidy_dt
+```
+
+```{r}
+summary(tidy_dt)
+```
+
+## Exploratory analysis
+
+```{r}
+tidy_dt |>
+  pivot_longer(dem:other) |>
+  group_by(year, name) |>
+  summarize(
+    value = sum(value)
+  ) |>
+  ggplot() +
+  aes(x = year, y = value, color = name) +
+  geom_point() +
+  geom_line() +
+  labs(
+    x = "Election Year",
+    y = "Total Ballots"
+  )
+```
+
+## Prepping for modeling
+
+```{r}
+tidy_dt |>
+  mutate(
+    dem_share = dem / total,
+    rep_share = rep / total,
+    otr_share = other / total
+  ) |>
+  group_by(county_name) |>
+  mutate(
+    dem_share_lag = lag(dem_share, order_by = year),
+    rep_share_lag = lag(rep_share, order_by = year),
+    otr_share_lag = lag(otr_share, order_by = year),
+    total_lag = lag(total, order_by = year)
+  ) |>
+  ungroup() |>
+  mutate(
+    st = as.numeric(as.factor(state)),
+    cty = as.numeric(as.factor(county_name))
+  ) -> tidy_dt
+```
+
+## Modeling
+
+```{r}
+
+lhs <- ~ dem_share_lag + rep_share_lag + log(total_lag) +
+  state
+forms <- list(
+  update(lhs, dem_share ~ .),
+  update(lhs, rep_share ~ .),
+  update(lhs, log(total_lag) ~ .)
+)
+
+res_tbl <- expand_grid(
+  forms = forms,
+  election = seq(2004, 2020, by = 4)
+)
+
+res_tbl <- res_tbl |>
+  mutate(
+    outcome = rep(c("Dem Share", "Rep Share", "Turnout"), each = n() / 3),
+    fits = map2(
+      .x = forms,
+      .y = election,
+      .f = ~ lm(.x, data = filter(tidy_dt, year == .y))
+    )
+  )
+
+res_tbl |>
+  mutate(
+    ws_pred = map(
+      .x = fits,
+      .f = ~ summary(.x)$r.squared
+    ) |> unlist()
+  ) -> res_tbl
+
+```
+
+```{r}
+tidy_dt |>
+  group_by(state_po, year) |>
+  summarize(
+    across(c(dem:rep, total), sum)
+  ) |>
+  mutate(
+    across(dem:rep, ~ .x / (dem + rep), .names = "{.col}_prp"),
+    dem_margin = dem_prp - rep_prp
+  ) |>
+  group_by(state_po) |>
+  mutate(
+    dem_margin_lag = lag(dem_margin, order_by = year),
+    total_lag = lag(total, order_by = year)
+  ) -> st_dt
+
+
+library(lme4)
+lin_fit <- lmer(
+  dem_margin ~ dem_margin_lag +
+    log(total) +
+    (dem_margin_lag + log(total) | state_po),
+  data = st_dt
+)
+lgt_fit <- glmer(
+  dem_margin > 0 ~ dem_margin_lag +
+    log(total) +
+    (dem_margin_lag + log(total) | state_po),
+  data = st_dt,
+  family = binomial
+)
+
+MuMIn::r.squaredGLMM(lin_fit)
+MuMIn::r.squaredGLMM(lgt_fit)
+```
+
+
+
+```{r}
+new_dt <- st_dt |> 
+  filter(year == 2020) |>
+  mutate(
+    dem_margin_lag = dem_margin,
+    total = total_lag # assume turnout is more like 2016
+  )
+
+new_dt <- new_dt |>
+  ungroup() |>
+  mutate(
+    margin_pred_2024 = predict(lin_fit, newdata = new_dt),
+    prob_win_2024 = predict(lgt_fit, newdata = new_dt, type = "response")
+  )
+
+new_dt <- new_dt |>
+  ## add swing state indicator
+  mutate(
+    swing = ifelse(
+      state_po %in% c(
+        "GA",
+        "NV",
+        "WI",
+        "MI",
+        "AZ",
+        "PA"
+      ),
+      1, 0
+    )
+  )
+```
+
+```{r}
+set_palette(
+  diverging = c("red3", "white", "steelblue"),
+  binary = c("steelblue", "red3")
+)
+library(geofacet)
+library(grid)
+ggplot(new_dt) +
+  aes(
+    x = margin_pred_2024,
+    y = 1,
+    fill = margin_pred_2024,
+    label = paste0(round(margin_pred_2024 * 100), "%")
+  ) +
+  geom_tile(color = "black") +
+  geom_tile(
+    data = . %>% filter(swing == 1),
+    color = "black", 
+    size = 1
+  ) +
+  geom_text() +
+  facet_geo(~ state_po,
+            scales = "free") +
+  #theme_void() +
+  ggpal("diverging", "fill") +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = paste0(
+      "Predicted percentage point margin for\nKamala Harris vs. Trump"
+    ),
+    subtitle = paste0(
+      "Swing states are highlighted with darker boxes"
+    ),
+    caption = "Data source: MIT Election Lab | by @MDWilliamsPhD"
+  ) +
+  theme(
+    legend.position = "",
+    panel.grid.major = element_blank(),
+    axis.text = element_blank(),
+    strip.background = element_blank(),
+    panel.spacing = unit(0, "lines")
+  )
+ggsave(
+  here::here(
+    "_figs",
+    "predicted_margin_by_st.png"
+  ),
+  height = 5,
+  width = 6,
+  dpi = 500
+)
+```
+
+```{r}
+ggplot(new_dt) +
+  aes(
+    x = prob_win_2024,
+    y = 1,
+    fill = prob_win_2024,
+    label = paste0(round(prob_win_2024 * 100), "%")
+  ) +
+  geom_tile(color = "black") +
+  geom_tile(
+    data = . %>% filter(swing == 1),
+    color = "black", 
+    size = 1
+  ) +
+  geom_text() +
+  facet_geo(~ state_po,
+            scales = "free") +
+  #theme_void() +
+  ggpal("diverging", "fill", midpoint = 0.5) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = paste0(
+      "Predicted likelihood of victory for\nKamala Harris vs. Trump"
+    ),
+    subtitle = paste0(
+      "Swing states are highlighted with darker boxes"
+    ),
+    caption = "Data source: MIT Election Lab | by @MDWilliamsPhD"
+  ) +
+  theme(
+    legend.position = "",
+    panel.grid.major = element_blank(),
+    axis.text = element_blank(),
+    strip.background = element_blank(),
+    panel.spacing = unit(0, "lines")
+  )
+ggsave(
+  here::here(
+    "_figs",
+    "predicted_win_by_st.png"
+  ),
+  height = 5,
+  width = 6,
+  dpi = 500
+)
+```
+
+
+```{r}
+ec <- read_csv(
+  here::here("_data", "Electoral_College.csv")
+)
+colnames(ec) <- c(
+  "state", 
+  "state_po",
+  "ecv"
+)
+
+new_dt <- left_join(new_dt, ec, by = "state_po")
+
+new_dt |>
+  mutate(
+    ecwon = ifelse(
+      prob_win_2024 > 0.5, ecv, -ecv
+    )
+  ) -> new_dt
+
+new_dt |>
+  ungroup() |>
+  summarize(
+    ec_margin = sum(ecv * prob_win_2024)
+  ) |>
+  pull(
+    ec_margin
+  ) -> ec_margin
+
+## bootstrap this
+
+tibble(
+  it = 1:10000,
+  ec_margin = ec_margin,
+  ec_margin_bs = map(
+    .x = it,
+    .f = ~ new_dt |>
+      mutate(
+        ecwon = ifelse(
+          rbinom(n(), 1, prob_win_2024) > 0.5, ecv, 0
+        )
+      ) |>
+      ungroup() |>
+      summarize(
+        ec_margin = sum(ecwon)
+      ) |>
+      pull(
+        ec_margin
+      )
+  ) |> unlist()
+) -> bs_results
+```
+
+```{r}
+bs_results |>
+  group_by(ec_margin_bs) |>
+  summarize(
+    counts = n(),
+    ec_margin = unique(ec_margin)
+  ) |>
+  ungroup() |>
+  mutate(pct = counts / sum(counts)) |>
+  ggplot() +
+  aes(x = ec_margin_bs, y = pct) +
+  geom_col(
+    aes(fill = ec_margin_bs < 270,
+        color = ec_margin_bs < 270)
+  ) +
+  geom_vline(
+    xintercept = c(270, ec_margin),
+    size = 1,
+    lty = 2
+  ) +
+  ggpal("binary", "fill", labels = c("Harris Wins", "Trump Wins")) +
+  ggpal("binary", "color", labels = c("Harris Wins", "Trump Wins")) +
+  labs(
+    x = "Simulated Electoral College Votes",
+    y = "Share of Simulations",
+    title = paste0(
+      "Harris wins in ", 
+      round(mean(bs_results$ec_margin_bs > 270) * 100),
+      " out of 100 simulated elections\n"
+    ),
+    fill = NULL,
+    color = NULL,
+    caption = "\nData source: MIT Election Lab | by @MDWilliamsPhD"
+  ) +
+  scale_x_continuous(
+    sec.axis = sec_axis(
+      ~ . + 0,
+      breaks = c(270, ec_margin),
+      labels = c(
+        "270 votes\nneeded to win",
+        paste0(
+          "Harris is predicted to\nwin ",
+          round(ec_margin),
+          " EC votes"
+        )
+      )
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::percent
+  )
+ggsave(
+  here::here(
+    "_figs",
+    "hist_of_wins.png"
+  ),
+  height = 5,
+  width = 8,
+  dpi = 500
+)
+```
+
+
