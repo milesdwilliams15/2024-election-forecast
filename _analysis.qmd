@@ -11,7 +11,8 @@ Open the packages I need:
 library(tidyverse)
 library(coolorrr)
 set_theme()
-set_palette(binary = c("steelblue", "red3"))
+set_palette(diverging = c("red3", "white", "steelblue"),
+            binary = c("steelblue", "red3"))
 ```
 
 Next, read in the data (source is MIT Harvard Dataverse):
@@ -27,60 +28,47 @@ dt <- read_csv(
 
 ## Data wrangling
 
-I need to get the data into tidy format. At the moment there are multiple observations per county per year because votes per party are stacked on top of each other. Let's fix that and cut some of the extra fat along the way.
+I need to get the data into tidy format and collapse it to the state level of analysis.
 
 ```{r}
-tidy_dt <- dt |>
-  select(year:county_fips) |>
-  distinct()
-
-pty_dt <- dt |>
+dt |>
+  ## first collapse by year, state, and party vote totals
+  group_by(year, state, state_po, party) |>
+  summarize(
+    votes = sum(candidatevotes, na.rm = T),
+    .groups = "drop"
+  ) |>
+  ## make party names lower case
   mutate(
-    party = str_to_lower(party),
-    party = ifelse(!(party %in% c("democrat", "republican")),
-                   "other", party)
+    party = str_to_lower(party)
   ) |>
-  group_by(party) |>
-  group_split()
-
-tidy_dt |>
-  left_join(
-    pty_dt[[1]] |>
-      select(year, state, county_name, candidatevotes) |>
-      rename(dem = candidatevotes) |>
-      group_by(year, state, county_name) |>
-      summarize(dem = sum(dem))
+  ## next pivot the data by party
+  pivot_wider(
+    values_from = votes,
+    names_from = party
   ) |>
-  left_join(
-    pty_dt[[3]] |>
-      select(year, state, county_name, candidatevotes) |>
-      rename(rep = candidatevotes) |>
-      group_by(year, state, county_name) |>
-      summarize(rep = sum(rep))
-  ) |>
-  left_join(
-    pty_dt[[2]] |>
-      select(year, state, county_name, candidatevotes) |>
-      rename(other = candidatevotes) |>
-      group_by(year, state, county_name) |>
-      summarize(other = sum(other, na.rm = T))
-  ) -> tidy_dt
-
-tidy_dt |>
+  ## add a total votes column and keep rep and dem + all other votes
   mutate(
-    total = dem + rep + other
-  ) -> tidy_dt
+    total = rowSums(
+      cbind(democrat, green, other, republican, libertarian),
+      na.rm = T
+    )
+  ) |>
+  select(year, state, state_po, democrat, republican, total) |>
+  mutate(
+    other = total - democrat - republican
+  ) -> st_dt
 ```
 
 ```{r}
-summary(tidy_dt)
+summary(st_dt)
 ```
 
 ## Exploratory analysis
 
 ```{r}
-tidy_dt |>
-  pivot_longer(dem:other) |>
+st_dt |>
+  pivot_longer(democrat:other) |>
   group_by(year, name) |>
   summarize(
     value = sum(value)
@@ -92,152 +80,180 @@ tidy_dt |>
   labs(
     x = "Election Year",
     y = "Total Ballots"
-  )
+  ) +
+  ggpal()
 ```
 
-## Prepping for modeling
+## Modelling
+
+I'm going to use the democratic party margin in the previous election to predict the future margin. So I need to create a democratic margin variable and a previous election lag.
 
 ```{r}
-tidy_dt |>
+st_dt |>
+  ## create a democratic margin measure and a lagged version of it
+  group_by(state) |>
   mutate(
-    dem_share = dem / total,
-    rep_share = rep / total,
-    otr_share = other / total
+    dem_margin = 100 * (democrat / (democrat + republican) - 0.5),
+    dem_margin_lag = lag(dem_margin, order_by = year)
   ) |>
-  group_by(county_name) |>
-  mutate(
-    dem_share_lag = lag(dem_share, order_by = year),
-    rep_share_lag = lag(rep_share, order_by = year),
-    otr_share_lag = lag(otr_share, order_by = year),
-    total_lag = lag(total, order_by = year)
-  ) |>
-  ungroup() |>
-  mutate(
-    st = as.numeric(as.factor(state)),
-    cty = as.numeric(as.factor(county_name))
-  ) -> tidy_dt
+  ungroup() -> st_dt
 ```
 
-## Modeling
+My predictive model is going to be a multi-level linear regression with fixed and random slopes by state for the lagged democratic vote margin as the main predictor. The model will also include random state intercepts. 
 
 ```{r}
-
-lhs <- ~ dem_share_lag + rep_share_lag + log(total_lag) +
-  state
-forms <- list(
-  update(lhs, dem_share ~ .),
-  update(lhs, rep_share ~ .),
-  update(lhs, log(total_lag) ~ .)
-)
-
-res_tbl <- expand_grid(
-  forms = forms,
-  election = seq(2004, 2020, by = 4)
-)
-
-res_tbl <- res_tbl |>
-  mutate(
-    outcome = rep(c("Dem Share", "Rep Share", "Turnout"), each = n() / 3),
-    fits = map2(
-      .x = forms,
-      .y = election,
-      .f = ~ lm(.x, data = filter(tidy_dt, year == .y))
-    )
-  )
-
-res_tbl |>
-  mutate(
-    ws_pred = map(
-      .x = fits,
-      .f = ~ summary(.x)$r.squared
-    ) |> unlist()
-  ) -> res_tbl
-
-```
-
-```{r}
-tidy_dt |>
-  group_by(state_po, year) |>
-  summarize(
-    across(c(dem:rep, total), sum)
-  ) |>
-  mutate(
-    across(dem:rep, ~ .x / (dem + rep), .names = "{.col}_prp"),
-    dem_margin = dem_prp - rep_prp
-  ) |>
-  group_by(state_po) |>
-  mutate(
-    dem_margin_lag = lag(dem_margin, order_by = year),
-    total_lag = lag(total, order_by = year)
-  ) -> st_dt
-
-
+## specify a multilevel model of the democratic margin with
+## nesting within states.
 library(lme4)
-lin_fit <- lmer(
-  dem_margin ~ dem_margin_lag +
-    log(total) +
-    (dem_margin_lag + log(total) | state_po),
+lmer(
+  dem_margin ~ ## dem_margin is the outcome
+    dem_margin_lag + ## lag of dem margin FE
+    (dem_margin_lag | state), ## REs by state
   data = st_dt
-)
-lgt_fit <- glmer(
-  dem_margin > 0 ~ dem_margin_lag +
-    log(total) +
-    (dem_margin_lag + log(total) | state_po),
-  data = st_dt,
-  family = binomial
-)
+) -> mefit
 
-MuMIn::r.squaredGLMM(lin_fit)
-MuMIn::r.squaredGLMM(lgt_fit)
+## check out the results
+summary(mefit) ## model summary
+MuMIn::r.squaredGLMM(mefit) ## R-squared
 ```
 
+Looks like the previous election margin for the dems is a pretty good predictor of their future performance. Of course the R-squared is in-sample so it's not an ideal measure of the model's predictive performance. That metric will only be available when I get to test my predictions against the actual election returns for 2024. I'm basically running blind.
 
+## Quantifying uncertainty
+
+To get a sense for the range of empirically supported predictions from the model, I'm going to bootstrap to generate a distribution of predictions. With a multi-level model, bootstrapping is a computationally expensive but often necessary step to get standard errors for model predictions.
 
 ```{r}
-new_dt <- st_dt |> 
+## a function to re-sample states with replacement:
+sample_by_state <- function() {
+  st_dt |>
+    group_split(state) |>
+    sample(51, T) |>
+    bind_rows()
+}
+
+## boot strap the data 10,000x and save in a tibble:
+## (be patient)
+tibble(
+  it = 1:10000,
+  bdata = map(
+    .x = it,
+    .f = ~ sample_by_state()
+  ) 
+) -> boot_dt
+
+## re-estimate the model for each bootstrapped dataset:
+## (be patient...probably shoulda' done parallel computing)
+boot_dt |>
+  mutate(
+    bfit = map(
+      .x = bdata,
+      .f = ~ lmer(
+        dem_margin ~ 
+          dem_margin_lag +
+          (dem_margin_lag | state), 
+        data = .x
+      )
+    )
+  ) -> boot_dt
+```
+
+## Generate results
+
+First, I need to generate a set of predictions for 2024.
+
+```{r}
+## make a new prediction dataset:
+st_dt |>
   filter(year == 2020) |>
-  mutate(
-    dem_margin_lag = dem_margin,
-    total = total_lag # assume turnout is more like 2016
-  )
+  transmute(
+    state, state_po,
+    dem_margin_lag = dem_margin
+  ) -> nw_dt
 
-new_dt <- new_dt |>
-  ungroup() |>
+## add a new column with predicted dem margins:
+nw_dt |>
   mutate(
-    margin_pred_2024 = predict(lin_fit, newdata = new_dt),
-    prob_win_2024 = predict(lgt_fit, newdata = new_dt, type = "response")
-  )
+    pred = predict(mefit, nw_dt)
+  ) -> nw_dt
 
-new_dt <- new_dt |>
-  ## add swing state indicator
+## generate probabilities for dem victory with bootstrapped preds:
+## (be patient again)
+boot_dt |>
+  mutate(
+    pred_dt = map2(
+      .x = bdata,
+      .y = bfit,
+      .f = ~ .x |> filter(year == 2020) |>
+        transmute(state, state_po, dem_margin_lag = dem_margin) %>%
+        mutate(
+          pred = predict(.y, .)
+        )
+    )
+  ) -> boot_dt
+
+## generate state-level probabilities:
+boot_dt |>
+  select(pred_dt) |>
+  unnest() |>
+  group_by(state_po) |>
+  summarize(
+    prob_win = mean(pred >= 0)
+  ) -> prob_dt
+
+## merge in with nw_dt:
+left_join(
+  nw_dt,
+  prob_dt
+) -> nw_dt
+```
+
+Now to see how things shake out overall, I need to incorporate data on electoral college votes.
+
+```{r}
+read_csv(
+  here::here(
+    "_data",
+    "Electoral_College.csv"
+  )
+) -> ec
+
+colnames(ec) <- c("state", "state_po", "ecv")
+
+left_join(
+  nw_dt,
+  ec |> select(-state)
+) -> nw_dt
+```
+
+## Visualize the results
+
+Make a geofactet of the predicted margin.
+
+```{r}
+library(geofacet)
+library(grid)
+nw_dt |>
   mutate(
     swing = ifelse(
       state_po %in% c(
-        "GA",
-        "NV",
-        "WI",
+        "GA", 
+        "PA",
+        "NC",
         "MI",
+        "WI",
         "AZ",
-        "PA"
+        "NV"
       ),
       1, 0
     )
-  )
-```
-
-```{r}
-set_palette(
-  diverging = c("red3", "white", "steelblue"),
-  binary = c("steelblue", "red3")
-)
-library(geofacet)
-library(grid)
-ggplot(new_dt) +
+  ) -> nw_dt
+ggplot(nw_dt) +
   aes(
-    x = margin_pred_2024,
+    x = pred,
     y = 1,
-    fill = margin_pred_2024,
-    label = paste0(round(margin_pred_2024 * 100), "%")
+    fill = pred,
+    label = paste0(round(pred, 1), "%")
   ) +
   geom_tile(color = "black") +
   geom_tile(
@@ -259,33 +275,66 @@ ggplot(new_dt) +
     subtitle = paste0(
       "Swing states are highlighted with darker boxes"
     ),
-    caption = "Data source: MIT Election Lab | by @MDWilliamsPhD"
+    caption = "By @MDWilliamsPhD"
   ) +
   theme(
     legend.position = "",
     panel.grid.major = element_blank(),
     axis.text = element_blank(),
     strip.background = element_blank(),
-    panel.spacing = unit(0, "lines")
+    panel.spacing = unit(0, "lines"),
+    plot.subtitle = ggtext::element_markdown(
+      box.color = "black",
+      linewidth = 1, linetype = 1,
+      padding = unit(5, "pt"),
+      margin = margin(t = 5)
+    )
   )
 ggsave(
   here::here(
     "_figs",
     "predicted_margin_by_st.png"
   ),
-  height = 5,
-  width = 6,
+  height = 6,
+  width = 7,
   dpi = 500
 )
 ```
 
+
+Now simulate the election a bunch of times and generate a distribution of EC vote totals.
+
 ```{r}
-ggplot(new_dt) +
+## expected electoral college votes:
+nw_dt |>
+  summarize(
+    ecv_total = sum(ecv * (prob_win > .5))
+  ) |>
+  pull(ecv_total) -> ecv_total
+
+## distribution of votes:
+tibble(
+  it = 1:10000,
+  ecv_total_sim = map(
+    .x = it,
+    .f = ~ nw_dt |>
+      summarize(
+        ecv_total = sum(ecv * rbinom(n(), 1, prob_win))
+      ) |>
+      pull(ecv_total)
+  )
+) |>
+  unnest(ecv_total_sim) -> sim_results
+```
+
+
+```{r}
+ggplot(nw_dt) +
   aes(
-    x = prob_win_2024,
+    x = prob_win,
     y = 1,
-    fill = prob_win_2024,
-    label = paste0(round(prob_win_2024 * 100), "%")
+    fill = prob_win,
+    label = paste0(round(prob_win * 100, 1), "%")
   ) +
   geom_tile(color = "black") +
   geom_tile(
@@ -297,7 +346,7 @@ ggplot(new_dt) +
   facet_geo(~ state_po,
             scales = "free") +
   #theme_void() +
-  ggpal("diverging", "fill", midpoint = 0.5) +
+  ggpal("diverging", "fill", midpoint = .5) +
   labs(
     x = NULL,
     y = NULL,
@@ -307,139 +356,90 @@ ggplot(new_dt) +
     subtitle = paste0(
       "Swing states are highlighted with darker boxes"
     ),
-    caption = "Data source: MIT Election Lab | by @MDWilliamsPhD"
+    caption = "By @MDWilliamsPhD"
   ) +
   theme(
     legend.position = "",
     panel.grid.major = element_blank(),
     axis.text = element_blank(),
     strip.background = element_blank(),
-    panel.spacing = unit(0, "lines")
+    panel.spacing = unit(0, "lines"),
+    plot.subtitle = ggtext::element_markdown(
+      box.color = "black",
+      linewidth = 1, linetype = 1,
+      padding = unit(5, "pt"),
+      margin = margin(t = 5)
+    )
   )
 ggsave(
   here::here(
     "_figs",
     "predicted_win_by_st.png"
   ),
-  height = 5,
-  width = 6,
+  height = 6,
+  width = 7,
   dpi = 500
 )
 ```
 
-
 ```{r}
-ec <- read_csv(
-  here::here("_data", "Electoral_College.csv")
-)
-colnames(ec) <- c(
-  "state", 
-  "state_po",
-  "ecv"
-)
-
-new_dt <- left_join(new_dt, ec, by = "state_po")
-
-new_dt |>
-  mutate(
-    ecwon = ifelse(
-      prob_win_2024 > 0.5, ecv, -ecv
-    )
-  ) -> new_dt
-
-new_dt |>
-  ungroup() |>
-  summarize(
-    ec_margin = sum(ecv * prob_win_2024)
-  ) |>
-  pull(
-    ec_margin
-  ) -> ec_margin
-
-## bootstrap this
-
-tibble(
-  it = 1:10000,
-  ec_margin = ec_margin,
-  ec_margin_bs = map(
-    .x = it,
-    .f = ~ new_dt |>
-      mutate(
-        ecwon = ifelse(
-          rbinom(n(), 1, prob_win_2024) > 0.5, ecv, 0
-        )
-      ) |>
-      ungroup() |>
-      summarize(
-        ec_margin = sum(ecwon)
-      ) |>
-      pull(
-        ec_margin
-      )
-  ) |> unlist()
-) -> bs_results
-```
-
-```{r}
-bs_results |>
-  group_by(ec_margin_bs) |>
-  summarize(
-    counts = n(),
-    ec_margin = unique(ec_margin)
-  ) |>
-  ungroup() |>
-  mutate(pct = counts / sum(counts)) |>
+#| fig-height: 3
+#| fig-width: 8
+sim_results |>
+  count(ecv_total_sim) |>
   ggplot() +
-  aes(x = ec_margin_bs, y = pct) +
+  aes(ecv_total_sim, n / sum(n)) +
   geom_col(
-    aes(fill = ec_margin_bs < 270,
-        color = ec_margin_bs < 270)
-  ) +
-  geom_vline(
-    xintercept = c(270, ec_margin),
-    size = 1,
-    lty = 2
-  ) +
-  ggpal("binary", "fill", labels = c("Harris Wins", "Trump Wins")) +
-  ggpal("binary", "color", labels = c("Harris Wins", "Trump Wins")) +
-  labs(
-    x = "Simulated Electoral College Votes",
-    y = "Share of Simulations",
-    title = paste0(
-      "Harris wins in ", 
-      round(mean(bs_results$ec_margin_bs > 270) * 100),
-      " out of 100 simulated elections\n"
+    aes(
+      fill = ifelse(ecv_total_sim >= 270, 
+                     "Harris Wins", "Trump Wins")
     ),
+    color = "black"
+  ) +
+  geom_text(
+    aes(
+      label = scales::percent(n / sum(n)),
+      color = ifelse(ecv_total_sim >= 270, 
+                     "Harris Wins", "Trump Wins")
+      ),
+    vjust = -1,
+    show.legend = F
+  ) +
+  ggpal("binary", "fill") +
+  ggpal("binary", "color") +
+  facet_wrap(
+    ~ ecv_total_sim, 
+    nrow = 1, 
+    scales = "free_x",
+    strip.position = "bottom"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
     fill = NULL,
     color = NULL,
-    caption = "\nData source: MIT Election Lab | by @MDWilliamsPhD"
-  ) +
-  scale_x_continuous(
-    sec.axis = sec_axis(
-      ~ . + 0,
-      breaks = c(270, ec_margin),
-      labels = c(
-        "270 votes\nneeded to win",
-        paste0(
-          "Harris is predicted to\nwin ",
-          round(ec_margin),
-          " EC votes"
-        )
-      )
+    title = "Distribution of simulated Electoral College totals",
+    subtitle = paste0(
+      "The most likely outcome is that Harris wins\n",
+      "with ", ecv_total, " Electoral College votes."
     )
   ) +
-  scale_y_continuous(
-    labels = scales::percent
+  ylim(c(0, 1)) +
+  theme(
+    axis.text = element_blank(),
+    panel.grid.major = element_blank()
   )
 ggsave(
   here::here(
     "_figs",
     "hist_of_wins.png"
   ),
-  height = 5,
+  height = 3,
   width = 8,
   dpi = 500
 )
 ```
+
+
 
 
