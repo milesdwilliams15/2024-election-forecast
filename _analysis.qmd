@@ -184,8 +184,14 @@ boot_dt |>
     pred_dt = map2(
       .x = bdata,
       .y = bfit,
-      .f = ~ .x |> filter(year == 2020) |>
-        transmute(state, state_po, dem_margin_lag = dem_margin) %>%
+      .f = ~ .x |> 
+        filter(year == 2020) |>
+        transmute(
+          state, 
+          state_po, 
+          dem_margin_lag = dem_margin
+        ) |>
+        distinct() %>%
         mutate(
           pred = predict(.y, .)
         )
@@ -270,7 +276,7 @@ ggplot(nw_dt) +
     x = NULL,
     y = NULL,
     title = paste0(
-      "Predicted percentage point margin for\nKamala Harris vs. Trump"
+      "Predicted percentage point margin for\nKamala Harris vs. Donal Trump"
     ),
     subtitle = paste0(
       "Swing states are highlighted with darker boxes"
@@ -351,7 +357,7 @@ ggplot(nw_dt) +
     x = NULL,
     y = NULL,
     title = paste0(
-      "Predicted likelihood of victory for\nKamala Harris vs. Trump"
+      "Predicted likelihood of victory for\nKamala Harris vs. Donald Trump"
     ),
     subtitle = paste0(
       "Swing states are highlighted with darker boxes"
@@ -392,7 +398,7 @@ sim_results |>
   geom_col(
     aes(
       fill = ifelse(ecv_total_sim >= 270, 
-                     "Harris Wins", "Trump Wins")
+                     "Harris Wins", "It's a tie")
     ),
     color = "black"
   ) +
@@ -400,7 +406,7 @@ sim_results |>
     aes(
       label = scales::percent(n / sum(n)),
       color = ifelse(ecv_total_sim >= 270, 
-                     "Harris Wins", "Trump Wins")
+                     "Harris Wins", "It's a tie")
       ),
     vjust = -1,
     show.legend = F
@@ -420,9 +426,10 @@ sim_results |>
     color = NULL,
     title = "Distribution of simulated Electoral College totals",
     subtitle = paste0(
-      "The most likely outcome is that Harris wins\n",
+      "The most likely outcome is that Kamala Harris wins\n",
       "with ", ecv_total, " Electoral College votes."
-    )
+    ),
+    caption = "By @MDWilliamsPhD"
   ) +
   ylim(c(0, 1)) +
   theme(

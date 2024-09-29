@@ -1,16 +1,18 @@
 # 2024 Presidential Election Forecast
 
-For fun, I wanted to try my hand at a 2024 US Presidential election forecast. Here's the current predictions as of 9-28-2024.
+For fun, I wanted to try my hand at a 2024 US Presidential election forecast. Here's the current predictions as of 9-29-2024.
 
-First up are state-level predictions for Harris' popular vote margin relative to Trump's. These predictions are based on a hierarchical linear model fit using previous election state-level margins for the Democratic Party with random intercepts and slopes by state. The results show that Harris is predicted to win nearly all the swing states, but by very small margins.
+[**Note**: *The forecast doesn't currently factor in the separate electoral districts in Maine and Nebraska. In future versions of this, I plan to fix this as it may tilt the range of possible election outcomes more in favor of Donald Trump.*]
+
+First up are state-level predictions for Kamala Harris' popular vote margin relative to Donald Trump's. These predictions are based on a mixed-effects linear model fit using previous election state-level margins for the Democratic Party (going back to 2000) with random intercepts and slopes by state. The results show that Harris is predicted to win nearly all swing states, but by very narrow margins.
 
 ![](_figs/predicted_margin_by_st.png)
 
-Second up are state-level likelihoods that Harris will win the popular vote instead of Trump. These likelihoods are based on bootstrapped predictions from the previous model. The results show that Harris is likely to win 4 out of 7 swing states. While the model seems certain that she'll win Wisconsin, Michigan, Pennsylvania, and Nevada, the model indicates she'll more than likely lose Arizona, Georgia, and North Carolina.
+Second up are state-level likelihoods that Harris will win the popular vote instead of Trump. These likelihoods are based on bootstrapped predictions from the previous model. The results show that Harris is likely to win 4 out of 7 swing states. The model seems certain that she'll win Wisconsin, Michigan, Pennsylvania, and Nevada, but it indicates she'll more than likely lose Arizona, Georgia, and North Carolina.
 
 ![](_figs/predicted_win_by_st.png)
 
-Finally, the below figure simulates (based on the previously shown likelihoods) the range of possible Electoral College outcomes possible. The distribution is produced via 10,000 simulations of state-level wins and losses based on predicted probabilities of victory, with Harris' Electoral College total based on the sum of Electoral College votes she'd get if she won the relevant set of states. Harris is predicted to win the 2024 election with a very narrow margin of victory with 279 Electoral College votes—just 9 more than the 270 she needs to secure the presidency. There is a lot of uncertainty about this result; however, the range of empirically supported alternatives skews toward a Harris win with only a fraction of a percentage of scenarios where Trump wins by a narrow margin of 1 Electoral College vote.
+Finally, the below figure simulates (based on the previously shown likelihoods) the range of possible Electoral College vote totals Harris is likely to win. The distribution is produced via 10,000 simulations of state-level wins and losses based on predicted probabilities of victory. Harris is predicted to win the 2024 election with a very narrow margin of victory---279 Electoral College votes. This is only 9 more than the 270 she would need to secure the presidency. While there is a lot of uncertainty about this result, the range of empirically supported alternatives is heavily skewed toward a Harris win. Less than a percentage of the simulations are consistent with a tie in the Electoral College, and in no scenario does Trump secure the presidency.
 
 ![](_figs/hist_of_wins.png)
 
